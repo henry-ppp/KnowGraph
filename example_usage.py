@@ -1,20 +1,17 @@
 """Example usage of NLP and ML tools in this environment."""
 
-# NLTK - download required data on first run
 import nltk
-
-nltk.download("punkt", quiet=True)
-nltk.download("stopwords", quiet=True)
-
-from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# NLTK - download required data on first run
+nltk.download("punkt_tab", quiet=True)
+nltk.download("stopwords", quiet=True)
 
 # spaCy - requires: uv run python -m spacy download en_core_web_sm
 # import spacy
 # nlp = spacy.load("en_core_web_sm")
-
-# scikit-learn
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 # Example: NLTK tokenization
 text = "Natural language processing enables machines to understand human language."
