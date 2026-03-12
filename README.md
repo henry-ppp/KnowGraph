@@ -87,3 +87,16 @@ for phrase, score in keywords:
 ```powershell
 uv run python example_usage.py
 ```
+
+## Method Comparison on a pdf
+
+Benchmark on a 149-page business major book (~214k chars, ~33k words), extracting top 15 key phrases:
+
+| Method | PDF extraction | Keyphrase extraction | Total | Result quality |
+|--------|----------------|----------------------|-------|----------------|
+| **YAKE** | 9.0s | 1.9s | 10.9s | Domain-relevant terms (entrepreneurship, entrepreneurs, business, economic). Clean, focused output. |
+| **RAKE** | 8.7s | 0.4s | 9.1s | Fastest, but heavily biased toward long name lists from acknowledgments. Less useful for topic extraction. |
+| **TextRank** | 9.4s | 13.9s | 23.3s | Good domain phrases (business entrepreneurs, new businesses, entrepreneurial firms). Coherent, readable. |
+| **KeyBERT** | 8.3s | 149.7s | 158.0s | Semantic, domain-aware (entrepreneurship, economics). Some PDF artifacts (e.g. hyphenation splits). Slowest due to model loading and embedding. |
+
+**Summary:** YAKE and TextRank offer the best balance of quality and speed for this text-heavy PDF. RAKE is fastest but prone to noisy results on documents with acknowledgments or lists. KeyBERT is most semantically accurate but ~2.5 min for keyphrase extraction on 33k words.
