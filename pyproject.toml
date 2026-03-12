@@ -1,0 +1,17 @@
+[project]
+name = "knowgraph"
+version = "0.1.0"
+description = "NLP and light ML tools for KnowGraph"
+requires-python = ">=3.11"
+dependencies = [
+    "nltk>=3.9.3",
+    "numpy>=2.4.3",
+    "pandas>=3.0.1",
+    "scikit-learn>=1.8.0",
+    "spacy>=3.8.11",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers>=5.3.0",
+]
