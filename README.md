@@ -1,6 +1,6 @@
 # KnowGraph
 
-NLP and light ML environment powered by [uv](https://docs.astral.sh/uv/), with keyphrase extraction from PDF documents.
+Experiments on different approaches of extracting key topics from a long pdf, with NLP and light ML environment powered by [uv](https://docs.astral.sh/uv/).
 
 ## Setup
 
