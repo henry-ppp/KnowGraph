@@ -119,7 +119,7 @@ Results are saved to `{output-dir}/{pdf_stem}/`:
 - `embeddings.npy` — embedding vectors
 - `umap_reduced.npy` — Reduced vectors (when using umap or pca)
 - `cluster_labels.json` — Cluster label per chunk (-1 = noise for HDBSCAN only; agglomerative assigns all)
-- `topics.json` — final topics with labels and chunk indices
+- `topics.json` — final topics with labels, chunk indices, and `is_paratext` (true when content is boilerplate: copyright, TOC, acknowledgements, etc.)
 - `metadata.json` — run parameters, per-step timing, token usage
 
 ### Python API

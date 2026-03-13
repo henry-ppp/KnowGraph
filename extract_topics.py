@@ -33,6 +33,7 @@ class Topic:
     cluster_id: int
     chunk_indices: list[int]
     representative_excerpts: list[str]
+    is_paratext: bool = False
 
 
 def _count_tokens(text: str, encoding_name: str = "cl100k_base") -> int:
@@ -408,7 +409,14 @@ def _label_clusters_llm(
             "You are an expert at summarizing document themes. "
             "Given representative text excerpts from a cluster of similar passages, "
             "produce a short, concise topic label (3–6 words). "
-            "Output only the label, no explanation or punctuation."
+            "Output only the label, no explanation or punctuation.\n\n"
+            "If the content is paratext (boilerplate that is not main body content), "
+            "prefix your label with 'Paratext: ' followed by a short type. "
+            "Paratext includes: title page, copyright notice, table of contents, "
+            "acknowledgements, publisher/author info, publication lists, ordering info, "
+            "and similar front/back matter. Examples: 'Paratext: Table of contents', "
+            "'Paratext: Copyright and publisher info', 'Paratext: IEA publications list'. "
+            "For normal topical content, output just the topic label."
         )
         response = client.chat.completions.create(
             model=label_model,
@@ -680,6 +688,8 @@ def extract_topics_from_pdf(
 
     topics: list[Topic] = []
     for cluster_id in sorted(cluster_labels.keys()):
+        raw_label = cluster_labels[cluster_id]
+        is_paratext = raw_label.strip().lower().startswith("paratext:")
         indices = list(np.where(labels == cluster_id)[0])
         centroid = embeddings[indices].mean(axis=0)
         distances = np.linalg.norm(embeddings - centroid, axis=1)
@@ -687,10 +697,11 @@ def extract_topics_from_pdf(
         excerpts = [chunks[i][:200] + ("..." if len(chunks[i]) > 200 else "") for i in nearest]
         topics.append(
             Topic(
-                label=cluster_labels[cluster_id],
+                label=raw_label,
                 cluster_id=cluster_id,
                 chunk_indices=indices,
                 representative_excerpts=excerpts,
+                is_paratext=is_paratext,
             )
         )
 
@@ -863,7 +874,8 @@ def main() -> None:
             output_dir=None if args.no_output else args.output_dir,
         )
         for t in topics:
-            print(f'Topic: "{t.label}" ({len(t.chunk_indices)} chunks)')
+            marker = " [Paratext]" if t.is_paratext else ""
+            print(f'Topic: "{t.label}" ({len(t.chunk_indices)} chunks){marker}')
     except FileNotFoundError:
         print(f"Error: File not found: {args.pdf_path}", file=sys.stderr)
         sys.exit(1)
