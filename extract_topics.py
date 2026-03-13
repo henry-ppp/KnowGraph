@@ -5,11 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import json
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -147,13 +152,15 @@ async def _embed_batch(
     chunks: list[str],
     model: str,
     dimensions: int | None,
-) -> list[list[float]]:
-    """Embed a single batch of chunks."""
+) -> tuple[list[list[float]], int]:
+    """Embed a single batch of chunks. Returns (embeddings, token_count)."""
     kwargs: dict = {"model": model, "input": chunks}
     if dimensions is not None and ("3-small" in model or "3-large" in model):
         kwargs["dimensions"] = dimensions
     response = await client.embeddings.create(**kwargs)
-    return [d.embedding for d in sorted(response.data, key=lambda x: x.index)]
+    embeddings = [d.embedding for d in sorted(response.data, key=lambda x: x.index)]
+    tokens = response.usage.total_tokens if response.usage else 0
+    return embeddings, tokens
 
 
 async def embed_chunks_async(
@@ -163,8 +170,8 @@ async def embed_chunks_async(
     batch_tokens: int = 250_000,
     max_concurrent: int = 5,
     verbose: bool = False,
-) -> np.ndarray:
-    """Embed chunks using OpenAI API with async batching."""
+) -> tuple[np.ndarray, int]:
+    """Embed chunks using OpenAI API with async batching. Returns (embeddings, total_tokens)."""
     try:
         from openai import AsyncOpenAI
     except ImportError:
@@ -208,13 +215,16 @@ async def embed_chunks_async(
 
     sem = asyncio.Semaphore(max_concurrent)
 
-    async def limited_embed(b: list[str]) -> list[list[float]]:
+    async def limited_embed(b: list[str]) -> tuple[list[list[float]], int]:
         async with sem:
             return await _embed_batch(client, b, model, dimensions)
 
     results = await asyncio.gather(*[limited_embed(b) for b in batches])
-    all_embeddings = [emb for batch in results for emb in batch]
-    return np.array(all_embeddings, dtype=np.float32)
+    all_embeddings = [emb for batch, _ in results for emb in batch]
+    total_tokens = sum(tokens for _, tokens in results)
+    if verbose:
+        _log(f"      Embedding tokens: {total_tokens:,}", verbose)
+    return np.array(all_embeddings, dtype=np.float32), total_tokens
 
 
 def embed_chunks(
@@ -224,8 +234,8 @@ def embed_chunks(
     batch_tokens: int = 250_000,
     max_concurrent: int = 5,
     verbose: bool = False,
-) -> np.ndarray:
-    """Synchronous wrapper for embed_chunks_async."""
+) -> tuple[np.ndarray, int]:
+    """Synchronous wrapper for embed_chunks_async. Returns (embeddings, total_tokens)."""
     return asyncio.run(
         embed_chunks_async(
             chunks, model, dimensions, batch_tokens, max_concurrent, verbose
@@ -233,15 +243,33 @@ def embed_chunks(
     )
 
 
+def reduce_pca(
+    embeddings: np.ndarray,
+    n_components: int = 5,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Reduce embedding dimensions using PCA. Much faster than UMAP."""
+    from sklearn.decomposition import PCA
+
+    _log("[4/6] Reducing dimensions with PCA...", verbose)
+    n_components = min(n_components, embeddings.shape[0], embeddings.shape[1])
+    reducer = PCA(n_components=n_components, random_state=42)
+    reduced = reducer.fit_transform(embeddings)
+    if verbose:
+        _log(f"      {embeddings.shape[1]}D -> {n_components}D", verbose)
+    return reduced
+
+
 def reduce_umap(
     embeddings: np.ndarray,
     n_components: int = 5,
-    n_neighbors: int = 15,
+    n_neighbors: int = 10,
+    n_epochs: int = 100,
     min_dist: float = 0.0,
-    random_state: int = 42,
+    random_state: int | None = None,
     verbose: bool = False,
 ) -> np.ndarray:
-    """Reduce embedding dimensions using UMAP."""
+    """Reduce embedding dimensions using UMAP. Uses random_state=None for parallelism."""
     try:
         from umap import UMAP
     except ImportError:
@@ -252,8 +280,12 @@ def reduce_umap(
     reducer = UMAP(
         n_components=n_components,
         n_neighbors=min(n_neighbors, len(embeddings) - 1),
+        n_epochs=n_epochs,
+        init="pca",
         min_dist=min_dist,
+        low_memory=False,
         random_state=random_state,
+        n_jobs=-1,
     )
     reduced = reducer.fit_transform(embeddings)
     if verbose:
@@ -288,6 +320,46 @@ def cluster_hdbscan(
     return labels
 
 
+def cluster_agglomerative(
+    embeddings: np.ndarray,
+    n_clusters: int = 15,
+    linkage: str = "ward",
+    metric: str = "euclidean",
+    verbose: bool = False,
+) -> np.ndarray:
+    """Cluster embeddings using Agglomerative Clustering. No dimensionality reduction needed."""
+    from sklearn.cluster import AgglomerativeClustering
+
+    _log("[5/6] Clustering with Agglomerative...", verbose)
+    n_clusters = min(n_clusters, len(embeddings))
+    clusterer = AgglomerativeClustering(
+        n_clusters=n_clusters,
+        linkage=linkage,
+        metric=metric,
+    )
+    labels = clusterer.fit_predict(embeddings)
+    if verbose:
+        _log(f"      Found {n_clusters} clusters", verbose)
+    return labels
+
+
+def cluster_embeddings(
+    embeddings: np.ndarray,
+    method: str = "hdbscan",
+    min_cluster_size: int = 3,
+    n_clusters: int = 15,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Cluster embeddings using HDBSCAN or Agglomerative."""
+    if method == "agglomerative":
+        return cluster_agglomerative(
+            embeddings, n_clusters=n_clusters, verbose=verbose
+        )
+    return cluster_hdbscan(
+        embeddings, min_cluster_size=min_cluster_size, verbose=verbose
+    )
+
+
 def _label_clusters_llm(
     chunks: list[str],
     labels: np.ndarray,
@@ -296,8 +368,8 @@ def _label_clusters_llm(
     k_nearest: int = 5,
     excerpt_chars: int = 200,
     verbose: bool = False,
-) -> dict[int, str]:
-    """Label clusters using LLM on representative chunks."""
+) -> tuple[dict[int, str], dict[str, int]]:
+    """Label clusters using LLM on representative chunks. Returns (labels, usage)."""
     try:
         from openai import OpenAI
     except ImportError:
@@ -308,7 +380,7 @@ def _label_clusters_llm(
     client = OpenAI()
     unique_labels = sorted(set(labels) - {-1})
     if not unique_labels:
-        return {}
+        return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     cluster_chunk_indices: dict[int, list[int]] = {}
     for i, lbl in enumerate(labels):
@@ -317,6 +389,8 @@ def _label_clusters_llm(
 
     labels_to_label = [lbl for lbl in unique_labels if lbl in cluster_chunk_indices]
     result: dict[int, str] = {}
+    total_prompt = 0
+    total_completion = 0
 
     for cluster_id in labels_to_label:
         indices = cluster_chunk_indices[cluster_id]
@@ -344,13 +418,22 @@ def _label_clusters_llm(
             ],
             temperature=0.3,
         )
+        if response.usage:
+            total_prompt += response.usage.prompt_tokens
+            total_completion += response.usage.completion_tokens
         label_text = response.choices[0].message.content or "Unlabeled"
         label_text = label_text.strip().strip('"\'')
         result[cluster_id] = label_text
 
+    usage = {
+        "prompt_tokens": total_prompt,
+        "completion_tokens": total_completion,
+        "total_tokens": total_prompt + total_completion,
+    }
     if verbose:
         _log(f"      Labeled {len(result)} clusters", verbose)
-    return result
+        _log(f"      LLM tokens: {usage['total_tokens']:,} (prompt: {usage['prompt_tokens']:,}, completion: {usage['completion_tokens']:,})", verbose)
+    return result, usage
 
 
 def _label_clusters_yake(
@@ -408,10 +491,10 @@ def label_clusters(
     label_model: str = "gpt-4o-mini",
     k_nearest: int = 5,
     verbose: bool = False,
-) -> dict[int, str]:
-    """Label clusters using LLM or YAKE."""
+) -> tuple[dict[int, str], dict[str, int] | None]:
+    """Label clusters using LLM or YAKE. Returns (labels, usage). Usage is None for YAKE."""
     if method == "yake":
-        return _label_clusters_yake(chunks, labels, embeddings, k_nearest, verbose)
+        return _label_clusters_yake(chunks, labels, embeddings, k_nearest, verbose), None
     return _label_clusters_llm(
         chunks, labels, embeddings, label_model, k_nearest, verbose=verbose
     )
@@ -433,6 +516,48 @@ def _load_embedding_cache(cache_path: Path, chunk_hashes: list[str]) -> np.ndarr
         return None
 
 
+def _to_json_serializable(obj: object) -> object:
+    """Convert numpy types to Python types for JSON serialization."""
+    if hasattr(obj, "item"):  # numpy scalar
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: _to_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_json_serializable(v) for v in obj]
+    return obj
+
+
+def _save_pipeline_results(
+    out_dir: Path,
+    *,
+    chunks: list[str],
+    embeddings: np.ndarray,
+    umap_reduced: np.ndarray | None,
+    labels: np.ndarray,
+    topics: list[Topic],
+    metadata: dict,
+) -> None:
+    """Save intermediate and final results for further analysis."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "chunks.json", "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False, indent=2)
+    np.save(out_dir / "embeddings.npy", embeddings)
+    if umap_reduced is not None:
+        np.save(out_dir / "umap_reduced.npy", umap_reduced)
+    with open(out_dir / "cluster_labels.json", "w", encoding="utf-8") as f:
+        json.dump([int(x) for x in labels.tolist()], f)
+
+    with open(out_dir / "topics.json", "w", encoding="utf-8") as f:
+        json.dump(
+            [_to_json_serializable(asdict(t)) for t in topics],
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(_to_json_serializable(metadata), f, indent=2)
+
+
 def _save_embedding_cache(cache_path: Path, hashes: list[str], embeddings: np.ndarray) -> None:
     """Save embeddings to cache."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -450,30 +575,47 @@ def extract_topics_from_pdf(
     model: str = "text-embedding-3-small",
     dimensions: int | None = 256,
     min_cluster_size: int = 3,
-    use_umap: bool = True,
-    umap_components: int = 5,
+    cluster_method: str = "hdbscan",
+    n_clusters: int = 15,
+    reduce_method: str = "umap",
+    reduce_components: int = 5,
     label_method: str = "llm",
     label_model: str = "gpt-4o-mini",
     cache_dir: str | Path = ".cache/topics",
     use_cache: bool = True,
     verbose: bool = False,
+    usage: dict[str, int] | None = None,
+    output_dir: str | Path | None = "output/topics",
 ) -> list[Topic]:
-    """Extract topics from a PDF using the full embedding-based pipeline."""
+    """Extract topics from a PDF using the full embedding-based pipeline.
+
+    If usage is provided (e.g. usage={}), it will be populated with embedding_tokens,
+    llm_prompt_tokens, llm_completion_tokens, llm_total_tokens.
+
+    If output_dir is provided, saves intermediate and final results to output_dir/{pdf_stem}/.
+    """
+    step_times: dict[str, float] = {}
     t0 = time.perf_counter()
     text = extract_text_pymupdf(path, verbose=verbose)
-    t1 = time.perf_counter()
+    step_times["extraction"] = time.perf_counter() - t0
     if verbose:
-        _log(f"      Extraction: {t1 - t0:.2f}s", verbose)
+        _log(f"      Extraction: {step_times['extraction']:.2f}s", verbose)
     if not text.strip():
         raise ValueError(f"No text extracted from {path}. Is it a scanned/image PDF?")
 
+    t1 = time.perf_counter()
     chunks = chunk_text_recursive(text, verbose=verbose)
+    step_times["chunking"] = time.perf_counter() - t1
+    if verbose:
+        _log(f"      Chunking: {step_times['chunking']:.2f}s", verbose)
     if len(chunks) < 2:
         raise ValueError(f"Too few chunks ({len(chunks)}). Document may be too short.")
 
     chunk_hashes = [hashlib.sha256(c.encode()).hexdigest() for c in chunks]
     cache_path = Path(cache_dir) / "embeddings.json" if use_cache else None
+    embedding_tokens = 0
 
+    t2 = time.perf_counter()
     if use_cache and cache_path:
         cached = _load_embedding_cache(cache_path, chunk_hashes)
         if cached is not None:
@@ -481,29 +623,60 @@ def extract_topics_from_pdf(
             if verbose:
                 _log("[3/6] Loaded embeddings from cache", verbose)
         else:
-            embeddings = embed_chunks(
+            embeddings, embedding_tokens = embed_chunks(
                 chunks, model=model, dimensions=dimensions, verbose=verbose
             )
             _save_embedding_cache(cache_path, chunk_hashes, embeddings)
     else:
-        embeddings = embed_chunks(
+        embeddings, embedding_tokens = embed_chunks(
             chunks, model=model, dimensions=dimensions, verbose=verbose
         )
+    step_times["embedding"] = time.perf_counter() - t2
+    if verbose:
+        _log(f"      Embedding: {step_times['embedding']:.2f}s", verbose)
 
-    if use_umap:
-        to_cluster = reduce_umap(
-            embeddings, n_components=umap_components, verbose=verbose
-        )
-    else:
+    t3 = time.perf_counter()
+    if cluster_method == "agglomerative":
         to_cluster = embeddings
+        reduced = None
+        if verbose:
+            _log("[4/6] Skipping reduction (agglomerative clusters on raw embeddings)", verbose)
+    elif reduce_method == "none":
+        to_cluster = embeddings
+        reduced = None
+    elif reduce_method == "umap":
+        to_cluster = reduce_umap(
+            embeddings, n_components=reduce_components, verbose=verbose
+        )
+        reduced = to_cluster
+    elif reduce_method == "pca":
+        to_cluster = reduce_pca(
+            embeddings, n_components=reduce_components, verbose=verbose
+        )
+        reduced = to_cluster
+    step_times["reduction"] = time.perf_counter() - t3
+    if verbose and cluster_method != "agglomerative":
+        _log(f"      Reduction ({reduce_method}): {step_times['reduction']:.2f}s", verbose)
 
-    labels = cluster_hdbscan(
-        to_cluster, min_cluster_size=min_cluster_size, verbose=verbose
+    t4 = time.perf_counter()
+    labels = cluster_embeddings(
+        to_cluster,
+        method=cluster_method,
+        min_cluster_size=min_cluster_size,
+        n_clusters=n_clusters,
+        verbose=verbose,
     )
+    step_times["clustering"] = time.perf_counter() - t4
+    if verbose:
+        _log(f"      Clustering: {step_times['clustering']:.2f}s", verbose)
 
-    cluster_labels = label_clusters(
+    t5 = time.perf_counter()
+    cluster_labels, llm_usage = label_clusters(
         chunks, labels, embeddings, method=label_method, label_model=label_model, verbose=verbose
     )
+    step_times["labeling"] = time.perf_counter() - t5
+    if verbose:
+        _log(f"      Labeling: {step_times['labeling']:.2f}s", verbose)
 
     topics: list[Topic] = []
     for cluster_id in sorted(cluster_labels.keys()):
@@ -521,8 +694,65 @@ def extract_topics_from_pdf(
             )
         )
 
+    total_time = time.perf_counter() - t0
     if verbose:
-        _log(f"      Total: {time.perf_counter() - t0:.2f}s", verbose)
+        _log(f"      Total: {total_time:.2f}s", verbose)
+        _log("", verbose)
+        _log("Step timing:", verbose)
+        for step, sec in step_times.items():
+            _log(f"  {step}: {sec:.2f}s", verbose)
+
+    if output_dir is not None:
+        pdf_stem = Path(path).stem
+        out_path = Path(output_dir) / pdf_stem
+        metadata = {
+            "pdf_path": str(path),
+            "model": model,
+            "dimensions": dimensions,
+            "cluster_method": cluster_method,
+            "min_cluster_size": min_cluster_size,
+            "n_clusters": n_clusters,
+            "reduce_method": "skipped" if cluster_method == "agglomerative" else reduce_method,
+            "reduce_components": reduce_components,
+            "label_method": label_method,
+            "label_model": label_model,
+            "n_chunks": len(chunks),
+            "n_clusters": len(cluster_labels),
+            "total_time_seconds": round(total_time, 2),
+            "step_times_seconds": {k: round(v, 2) for k, v in step_times.items()},
+            "embedding_tokens": embedding_tokens,
+            "llm_prompt_tokens": llm_usage["prompt_tokens"] if llm_usage else 0,
+            "llm_completion_tokens": llm_usage["completion_tokens"] if llm_usage else 0,
+            "llm_total_tokens": llm_usage["total_tokens"] if llm_usage else 0,
+        }
+        _save_pipeline_results(
+            out_path,
+            chunks=chunks,
+            embeddings=embeddings,
+            umap_reduced=reduced,
+            labels=labels,
+            topics=topics,
+            metadata=metadata,
+        )
+        if verbose:
+            _log(f"      Results saved to {out_path}", verbose)
+
+    if usage is not None:
+        usage["embedding_tokens"] = embedding_tokens
+        if llm_usage:
+            usage["llm_prompt_tokens"] = llm_usage["prompt_tokens"]
+            usage["llm_completion_tokens"] = llm_usage["completion_tokens"]
+            usage["llm_total_tokens"] = llm_usage["total_tokens"]
+        else:
+            usage["llm_prompt_tokens"] = 0
+            usage["llm_completion_tokens"] = 0
+            usage["llm_total_tokens"] = 0
+        if verbose:
+            _log("", verbose)
+            _log("Token usage:", verbose)
+            _log(f"  Embedding: {usage['embedding_tokens']:,} tokens", verbose)
+            _log(f"  LLM:      {usage['llm_total_tokens']:,} tokens (prompt: {usage['llm_prompt_tokens']:,}, completion: {usage['llm_completion_tokens']:,})", verbose)
+            _log(f"  Total:    {usage['embedding_tokens'] + usage['llm_total_tokens']:,} tokens", verbose)
     return topics
 
 
@@ -545,15 +775,39 @@ def main() -> None:
         help="Embedding dimensions (default: 256)",
     )
     parser.add_argument(
+        "--cluster-method",
+        choices=["hdbscan", "agglomerative"],
+        default="hdbscan",
+        help="Clustering method: hdbscan (default) or agglomerative. Agglomerative skips reduction.",
+    )
+    parser.add_argument(
+        "--n-clusters",
+        type=int,
+        default=15,
+        help="Number of clusters for agglomerative (default: 15). Ignored for hdbscan.",
+    )
+    parser.add_argument(
         "--min-cluster-size",
         type=int,
         default=3,
-        help="HDBSCAN min cluster size (default: 3)",
+        help="HDBSCAN min cluster size (default: 3). Used only with --cluster-method hdbscan.",
+    )
+    parser.add_argument(
+        "--reduce-method",
+        choices=["umap", "pca", "none"],
+        default="umap",
+        help="Dimensionality reduction: umap (default), pca (faster), or none",
+    )
+    parser.add_argument(
+        "--reduce-components",
+        type=int,
+        default=5,
+        help="Output dimensions for umap/pca (default: 5)",
     )
     parser.add_argument(
         "--no-umap",
         action="store_true",
-        help="Skip UMAP dimensionality reduction",
+        help="Skip dimensionality reduction (same as --reduce-method none)",
     )
     parser.add_argument(
         "--label-method",
@@ -576,21 +830,37 @@ def main() -> None:
         action="store_true",
         help="Disable embedding cache",
     )
+    parser.add_argument(
+        "--output-dir",
+        default="output/topics",
+        help="Directory to save intermediate and final results (default: output/topics)",
+    )
+    parser.add_argument(
+        "--no-output",
+        action="store_true",
+        help="Do not save results to disk",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Show processing steps")
     args = parser.parse_args()
 
     try:
+        usage: dict[str, int] = {}
         topics = extract_topics_from_pdf(
             args.pdf_path,
             model=args.model,
             dimensions=args.dimensions,
             min_cluster_size=args.min_cluster_size,
-            use_umap=not args.no_umap,
+            cluster_method=args.cluster_method,
+            n_clusters=args.n_clusters,
+            reduce_method="none" if args.no_umap else args.reduce_method,
+            reduce_components=args.reduce_components,
             label_method=args.label_method,
             label_model=args.label_model,
             cache_dir=args.cache_dir,
             use_cache=not args.no_cache,
             verbose=args.verbose,
+            usage=usage,
+            output_dir=None if args.no_output else args.output_dir,
         )
         for t in topics:
             print(f'Topic: "{t.label}" ({len(t.chunk_indices)} chunks)')

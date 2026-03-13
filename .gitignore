@@ -12,3 +12,9 @@ pdf/
 
 # Topic extraction cache
 .cache/
+
+# Topic extraction output (intermediate + final results)
+output/
+
+# Environment variables (secrets)
+.env

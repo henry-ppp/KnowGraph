@@ -71,6 +71,12 @@ for phrase, score in keywords:
 
 Extract clustered topics from PDFs using OpenAI embeddings, UMAP, HDBSCAN, and LLM labeling. Requires `OPENAI_API_KEY` and `uv sync --extra topics`.
 
+Create a `.env` file (copy from `.env.example`) with your OpenAI API key:
+```powershell
+copy .env.example .env
+# Edit .env and add your OPENAI_API_KEY
+```
+
 ```powershell
 # LLM labeling (default, recommended)
 uv run python extract_topics.py document.pdf -v
@@ -84,8 +90,8 @@ uv run python extract_topics.py document.pdf --label-method yake -v
 1. **Text extraction** — PyMuPDF (fast, strips headers/footers)
 2. **Semantic chunking** — Recursive splitter (paragraphs → sentences → words)
 3. **Embedding** — OpenAI `text-embedding-3-small` (async, batched)
-4. **Dimensionality reduction** — UMAP (optional, `--no-umap` to skip)
-5. **Clustering** — HDBSCAN (auto topic count)
+4. **Dimensionality reduction** — UMAP (default), PCA (faster), or none. *Skipped when using agglomerative.*
+5. **Clustering** — HDBSCAN (auto topic count) or Agglomerative (fixed `n_clusters`, clusters on raw embeddings)
 6. **Topic labeling** — LLM (default) or YAKE on representative chunks
 
 ### CLI Options
@@ -94,13 +100,27 @@ uv run python extract_topics.py document.pdf --label-method yake -v
 |--------|---------|--------------|
 | `--model` | text-embedding-3-small | Embedding model |
 | `--dimensions` | 256 | Embedding dimensions |
-| `--min-cluster-size` | 3 | HDBSCAN min cluster size |
-| `--no-umap` | - | Skip UMAP dimensionality reduction |
+| `--cluster-method` | hdbscan | `hdbscan` or `agglomerative`. Agglomerative skips reduction. |
+| `--n-clusters` | 15 | Number of clusters (agglomerative only) |
+| `--min-cluster-size` | 3 | HDBSCAN min cluster size (hdbscan only) |
+| `--reduce-method` | umap | `umap`, `pca` (faster), or `none`. Ignored when `--cluster-method agglomerative`. |
+| `--reduce-components` | 5 | Output dimensions for umap/pca |
+| `--no-umap` | - | Skip reduction (same as `--reduce-method none`) |
 | `--label-method` | llm | `llm` or `yake` |
 | `--label-model` | gpt-4o-mini | LLM for topic labeling |
 | `--cache-dir` | .cache/topics | Embedding cache directory |
 | `--no-cache` | - | Disable embedding cache |
-| `-v` | - | Verbose (timing per stage) |
+| `--output-dir` | output/topics | Save intermediate and final results |
+| `--no-output` | - | Do not save results to disk |
+| `-v` | - | Verbose (timing per stage, token usage) |
+
+Results are saved to `{output-dir}/{pdf_stem}/`:
+- `chunks.json` — text chunks
+- `embeddings.npy` — embedding vectors
+- `umap_reduced.npy` — Reduced vectors (when using umap or pca)
+- `cluster_labels.json` — Cluster label per chunk (-1 = noise for HDBSCAN only; agglomerative assigns all)
+- `topics.json` — final topics with labels and chunk indices
+- `metadata.json` — run parameters, per-step timing, token usage
 
 ### Python API
 
@@ -110,6 +130,11 @@ from extract_topics import extract_topics_from_pdf
 topics = extract_topics_from_pdf("document.pdf", verbose=True)
 for t in topics:
     print(f'Topic: "{t.label}" ({len(t.chunk_indices)} chunks)')
+
+# With token usage (also shown when verbose=True)
+usage = {}
+topics = extract_topics_from_pdf("document.pdf", usage=usage)
+print(f"Tokens: embedding={usage['embedding_tokens']:,}, LLM={usage['llm_total_tokens']:,}")
 ```
 
 ## Installed Packages
