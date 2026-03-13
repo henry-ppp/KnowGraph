@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 pdf/
+
+# Topic extraction cache
+.cache/

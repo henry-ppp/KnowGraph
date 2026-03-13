@@ -11,6 +11,9 @@ uv sync
 # Optional: KeyBERT (requires sentence-transformers, ~500MB)
 uv sync --extra embeddings
 
+# Optional: Topic extraction (OpenAI embeddings, UMAP, HDBSCAN)
+uv sync --extra topics
+
 # spaCy model for TextRank (run once)
 uv pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 ```
@@ -64,6 +67,51 @@ for phrase, score in keywords:
     print(f"{phrase}: {score:.4f}")
 ```
 
+## Topic Extraction
+
+Extract clustered topics from PDFs using OpenAI embeddings, UMAP, HDBSCAN, and LLM labeling. Requires `OPENAI_API_KEY` and `uv sync --extra topics`.
+
+```powershell
+# LLM labeling (default, recommended)
+uv run python extract_topics.py document.pdf -v
+
+# YAKE labeling (offline, no API)
+uv run python extract_topics.py document.pdf --label-method yake -v
+```
+
+### Pipeline
+
+1. **Text extraction** — PyMuPDF (fast, strips headers/footers)
+2. **Semantic chunking** — Recursive splitter (paragraphs → sentences → words)
+3. **Embedding** — OpenAI `text-embedding-3-small` (async, batched)
+4. **Dimensionality reduction** — UMAP (optional, `--no-umap` to skip)
+5. **Clustering** — HDBSCAN (auto topic count)
+6. **Topic labeling** — LLM (default) or YAKE on representative chunks
+
+### CLI Options
+
+| Option | Default | Description |
+|--------|---------|--------------|
+| `--model` | text-embedding-3-small | Embedding model |
+| `--dimensions` | 256 | Embedding dimensions |
+| `--min-cluster-size` | 3 | HDBSCAN min cluster size |
+| `--no-umap` | - | Skip UMAP dimensionality reduction |
+| `--label-method` | llm | `llm` or `yake` |
+| `--label-model` | gpt-4o-mini | LLM for topic labeling |
+| `--cache-dir` | .cache/topics | Embedding cache directory |
+| `--no-cache` | - | Disable embedding cache |
+| `-v` | - | Verbose (timing per stage) |
+
+### Python API
+
+```python
+from extract_topics import extract_topics_from_pdf
+
+topics = extract_topics_from_pdf("document.pdf", verbose=True)
+for t in topics:
+    print(f'Topic: "{t.label}" ({len(t.chunk_indices)} chunks)')
+```
+
 ## Installed Packages
 
 | Package | Purpose |
@@ -76,10 +124,15 @@ for phrase, score in keywords:
 | **nltk** | Tokenization, stopwords |
 | **scikit-learn** | ML utilities |
 | **keybert** *(optional)* | BERT-based extraction |
+| **openai** *(topics)* | Embedding and chat API |
+| **pymupdf** *(topics)* | Fast PDF text extraction |
+| **umap-learn** *(topics)* | Dimensionality reduction |
+| **hdbscan** *(topics)* | Density-based clustering |
+| **tiktoken** *(topics)* | Token counting for batching |
 
 ## Notes
 
-- **Text-based PDFs only**: pdfplumber extracts text from digital PDFs. Scanned/image PDFs require OCR (e.g. Tesseract).
+- **Text-based PDFs only**: pdfplumber (keyphrases) and PyMuPDF (topics) extract text from digital PDFs. Scanned/image PDFs require OCR (e.g. Tesseract).
 - **Charts and tables**: PDFs with many figures/tables may produce noisy keyphrases; YAKE or KeyBERT often handle these better than RAKE.
 
 ## Quick Test
