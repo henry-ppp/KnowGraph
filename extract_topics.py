@@ -410,12 +410,12 @@ def _label_clusters_llm(
             "Given representative text excerpts from a cluster of similar passages, "
             "produce a short, concise topic label (3–6 words). "
             "Output only the label, no explanation or punctuation.\n\n"
-            "If the content is paratext (boilerplate that is not main body content), "
+            "If the content is paratext (structural boilerplate, not main body content), "
             "prefix your label with 'Paratext: ' followed by a short type. "
-            "Paratext includes: title page, copyright notice, table of contents, "
-            "acknowledgements, publisher/author info, publication lists, ordering info, "
-            "and similar front/back matter. Examples: 'Paratext: Table of contents', "
-            "'Paratext: Copyright and publisher info', 'Paratext: IEA publications list'. "
+            "Paratext is front/back matter that frames the document: title, copyright, "
+            "TOC, acknowledgements, references, publisher info, institutional lists, "
+            "and similar material that does not convey the document's topical themes. "
+            "Use your judgment; do not rely on an exhaustive list. "
             "For normal topical content, output just the topic label."
         )
         response = client.chat.completions.create(
