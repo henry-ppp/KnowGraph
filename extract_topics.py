@@ -717,7 +717,7 @@ def extract_topics_from_pdf(
             "label_method": label_method,
             "label_model": label_model,
             "n_chunks": len(chunks),
-            "n_clusters": len(cluster_labels),
+            "n_clusters_found": len(cluster_labels),
             "total_time_seconds": round(total_time, 2),
             "step_times_seconds": {k: round(v, 2) for k, v in step_times.items()},
             "embedding_tokens": embedding_tokens,
