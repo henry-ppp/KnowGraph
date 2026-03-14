@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
 import asyncio
 import hashlib
 
@@ -149,7 +153,7 @@ def _get_embedding_encoding(model: str) -> str:
 
 
 async def _embed_batch(
-    client: "OpenAI",
+    client: "AsyncOpenAI",
     chunks: list[str],
     model: str,
     dimensions: int | None,
@@ -368,17 +372,20 @@ def _label_clusters_llm(
     label_model: str = "gpt-4o-mini",
     k_nearest: int = 5,
     excerpt_chars: int = 200,
+    batch_size: int = 5,
+    max_concurrent: int = 5,
     verbose: bool = False,
 ) -> tuple[dict[int, str], dict[str, int]]:
-    """Label clusters using LLM on representative chunks. Returns (labels, usage)."""
+    """Label clusters using LLM on representative chunks. Batches multiple clusters per
+    API call and runs batches concurrently. Returns (labels, usage)."""
     try:
-        from openai import OpenAI
+        from openai import AsyncOpenAI
     except ImportError:
         raise RuntimeError(
             "openai not installed. Run: uv sync --extra topics"
         )
-    _log("[6/6] Labeling clusters with LLM...", verbose)
-    client = OpenAI()
+    _log("[6/6] Labeling clusters with LLM (batched)...", verbose)
+    client = AsyncOpenAI()
     unique_labels = sorted(set(labels) - {-1})
     if not unique_labels:
         return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -389,11 +396,8 @@ def _label_clusters_llm(
             cluster_chunk_indices.setdefault(lbl, []).append(i)
 
     labels_to_label = [lbl for lbl in unique_labels if lbl in cluster_chunk_indices]
-    result: dict[int, str] = {}
-    total_prompt = 0
-    total_completion = 0
 
-    for cluster_id in labels_to_label:
+    def build_excerpts_for_cluster(cluster_id: int) -> str:
         indices = cluster_chunk_indices[cluster_id]
         centroid = embeddings[indices].mean(axis=0)
         distances = np.linalg.norm(embeddings - centroid, axis=1)
@@ -403,43 +407,83 @@ def _label_clusters_llm(
             chunk = chunks[idx]
             excerpt = chunk[:excerpt_chars] + ("..." if len(chunk) > excerpt_chars else "")
             excerpts.append(f"[{j + 1}] {excerpt}")
-        combined = "\n\n".join(excerpts)
+        return "\n".join(excerpts)
 
-        system = (
-            "You are an expert at summarizing document themes. "
-            "Given representative text excerpts from a cluster of similar passages, "
-            "produce a short, concise topic label (3–6 words). "
-            "Output only the label, no explanation or punctuation.\n\n"
-            "If the content is paratext (structural boilerplate, not main body content), "
-            "prefix your label with 'Paratext: ' followed by a short type. "
-            "Paratext is front/back matter that frames the document: title, copyright, "
-            "TOC, acknowledgements, references, publisher info, institutional lists, "
-            "and similar material that does not convey the document's topical themes. "
-            "Use your judgment; do not rely on an exhaustive list. "
-            "For normal topical content, output just the topic label."
-        )
-        response = client.chat.completions.create(
+    batches: list[list[int]] = []
+    for i in range(0, len(labels_to_label), batch_size):
+        batches.append(labels_to_label[i : i + batch_size])
+
+    system = (
+        "You are an expert at summarizing document themes. "
+        "Given representative text excerpts from clusters of similar passages, "
+        "produce a short, concise topic label (3–6 words) for each cluster. "
+        "Output a JSON object mapping each cluster ID (as string key) to its label. "
+        "Example: {\"0\": \"Startup Funding\", \"1\": \"Market Analysis\"}\n\n"
+        "If the content is paratext (structural boilerplate, not main body content), "
+        "prefix your label with 'Paratext: ' followed by a short type. "
+        "Paratext is front/back matter that frames the document: title, copyright, "
+        "TOC, acknowledgements, references, publisher info, institutional lists, "
+        "and similar material that does not convey the document's topical themes. "
+        "Use your judgment; do not rely on an exhaustive list. "
+        "For normal topical content, output just the topic label. "
+        "Output only valid JSON, no other text."
+    )
+
+    async def label_batch(cluster_ids: list[int]) -> tuple[dict[int, str], int, int]:
+        parts = []
+        for cid in cluster_ids:
+            parts.append(f"--- Cluster {cid} ---\n{build_excerpts_for_cluster(cid)}")
+        user_content = "\n\n".join(parts)
+        response = await client.chat.completions.create(
             model=label_model,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": combined},
+                {"role": "user", "content": user_content},
             ],
             temperature=0.3,
+            response_format={"type": "json_object"},
         )
-        if response.usage:
-            total_prompt += response.usage.prompt_tokens
-            total_completion += response.usage.completion_tokens
-        label_text = response.choices[0].message.content or "Unlabeled"
-        label_text = label_text.strip().strip('"\'')
-        result[cluster_id] = label_text
+        prompt_tok = response.usage.prompt_tokens if response.usage else 0
+        compl_tok = response.usage.completion_tokens if response.usage else 0
+        raw = response.choices[0].message.content or "{}"
+        try:
+            parsed = json.loads(raw)
+            result_batch = {}
+            for cid in cluster_ids:
+                label = parsed.get(str(cid), "Unlabeled")
+                if isinstance(label, str):
+                    label = label.strip().strip('"\'')
+                else:
+                    label = "Unlabeled"
+                result_batch[cid] = label
+            return result_batch, prompt_tok, compl_tok
+        except json.JSONDecodeError:
+            return {cid: "Unlabeled" for cid in cluster_ids}, prompt_tok, compl_tok
 
-    usage = {
-        "prompt_tokens": total_prompt,
-        "completion_tokens": total_completion,
-        "total_tokens": total_prompt + total_completion,
-    }
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def limited_label_batch(b: list[int]) -> tuple[dict[int, str], int, int]:
+        async with sem:
+            return await label_batch(b)
+
+    async def run_all() -> tuple[dict[int, str], dict[str, int]]:
+        results = await asyncio.gather(*[limited_label_batch(b) for b in batches])
+        result: dict[int, str] = {}
+        total_prompt = 0
+        total_completion = 0
+        for r, p, c in results:
+            result.update(r)
+            total_prompt += p
+            total_completion += c
+        return result, {
+            "prompt_tokens": total_prompt,
+            "completion_tokens": total_completion,
+            "total_tokens": total_prompt + total_completion,
+        }
+
+    result, usage = asyncio.run(run_all())
     if verbose:
-        _log(f"      Labeled {len(result)} clusters", verbose)
+        _log(f"      Labeled {len(result)} clusters ({len(batches)} batch(es))", verbose)
         _log(f"      LLM tokens: {usage['total_tokens']:,} (prompt: {usage['prompt_tokens']:,}, completion: {usage['completion_tokens']:,})", verbose)
     return result, usage
 
@@ -498,13 +542,22 @@ def label_clusters(
     method: str = "llm",
     label_model: str = "gpt-4o-mini",
     k_nearest: int = 5,
+    label_batch_size: int = 5,
+    label_max_concurrent: int = 5,
     verbose: bool = False,
 ) -> tuple[dict[int, str], dict[str, int] | None]:
     """Label clusters using LLM or YAKE. Returns (labels, usage). Usage is None for YAKE."""
     if method == "yake":
         return _label_clusters_yake(chunks, labels, embeddings, k_nearest, verbose), None
     return _label_clusters_llm(
-        chunks, labels, embeddings, label_model, k_nearest, verbose=verbose
+        chunks,
+        labels,
+        embeddings,
+        label_model,
+        k_nearest,
+        batch_size=label_batch_size,
+        max_concurrent=label_max_concurrent,
+        verbose=verbose,
     )
 
 
@@ -589,6 +642,8 @@ def extract_topics_from_pdf(
     reduce_components: int = 5,
     label_method: str = "llm",
     label_model: str = "gpt-4o-mini",
+    label_batch_size: int = 5,
+    label_max_concurrent: int = 5,
     cache_dir: str | Path = ".cache/topics",
     use_cache: bool = True,
     verbose: bool = False,
@@ -680,7 +735,14 @@ def extract_topics_from_pdf(
 
     t5 = time.perf_counter()
     cluster_labels, llm_usage = label_clusters(
-        chunks, labels, embeddings, method=label_method, label_model=label_model, verbose=verbose
+        chunks,
+        labels,
+        embeddings,
+        method=label_method,
+        label_model=label_model,
+        label_batch_size=label_batch_size,
+        label_max_concurrent=label_max_concurrent,
+        verbose=verbose,
     )
     step_times["labeling"] = time.perf_counter() - t5
     if verbose:
@@ -832,6 +894,18 @@ def main() -> None:
         help="LLM for topic labeling (default: gpt-4o-mini)",
     )
     parser.add_argument(
+        "--label-batch-size",
+        type=int,
+        default=5,
+        help="Clusters per LLM labeling request (default: 5)",
+    )
+    parser.add_argument(
+        "--label-max-concurrent",
+        type=int,
+        default=5,
+        help="Max concurrent labeling batch requests (default: 5)",
+    )
+    parser.add_argument(
         "--cache-dir",
         default=".cache/topics",
         help="Embedding cache directory (default: .cache/topics)",
@@ -867,6 +941,8 @@ def main() -> None:
             reduce_components=args.reduce_components,
             label_method=args.label_method,
             label_model=args.label_model,
+            label_batch_size=args.label_batch_size,
+            label_max_concurrent=args.label_max_concurrent,
             cache_dir=args.cache_dir,
             use_cache=not args.no_cache,
             verbose=args.verbose,
